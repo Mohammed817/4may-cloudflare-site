@@ -1,131 +1,84 @@
 
-const FEED_URL = "https://www.4may.net/sec/RSS.aspx";
-const MAX_NEWS = 6;
+// Vercel - api/news.js
+// يسحب الأخبار التي تظهر أسفل هذا المنشور بالتحديد: https://www.4may.net/Mnews/138173
 
-function decodeEntities(s = "") {
-  return String(s)
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&#(\d+);/g, (_, n) =>
-      String.fromCodePoint(Number(n))
-    )
-    .replace(/&#x([\da-f]+);/gi, (_, n) =>
-      String.fromCodePoint(parseInt(n, 16))
-    );
-}
+const TARGET_URL = "https://www.4may.net/Mnews/138173";
+const MAX_NEWS = 20;
 
-function clean(s = "") {
-  return decodeEntities(
-    String(s)
-      .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
-      .replace(/<[^>]*>/g, " ")
-  ).replace(/\s+/g, " ").trim();
-}
+function clean(s=""){ return s.replace(/<[^>]*>/g," ").replace(/\s+/g," ").trim(); }
+function decodeEntities(s=""){ return s.replace(/&amp;/g,"&").replace(/&quot;/g,'"').replace(/&#39;|&apos;/g,"'").replace(/&lt;/g,"<").replace(/&gt;/g,">"); }
 
-function safeUrl(raw = "") {
-  try {
-    const u = new URL(decodeEntities(raw), "https://www.4may.net/");
-    if (!/^https?:$/.test(u.protocol)) return null;
-    if (!/(^|\.)4may\.net$/i.test(u.hostname)) return null;
-    return u.href;
-  } catch {
-    return null;
+function extractBottomNews(html){
+  const items=[]; 
+  const seen=new Set();
+  
+  // نحاول نحدد منطقة أسفل المقال: بعد كلمة "اقرأ أيضا" أو "أخبار ذات صلة" أو "المزيد"
+  // لو ما لقيناها، نأخذ كل الروابط في الصفحة ما عدا المقال نفسه
+  const lowerHtml = html.toLowerCase();
+  let startIdx = 0;
+  const markers = ["اقرأ أيضا", "اخبار ذات صلة", "أخبار ذات صلة", "اخبار متعلقة", "قد يعجبك", "المزيد من"];
+  for(const m of markers){
+    const idx = lowerHtml.indexOf(m.toLowerCase());
+    if(idx !== -1){ startIdx = idx; break; }
   }
-}
+  const relevantHtml = startIdx ? html.substring(startIdx) : html;
 
-function titleKey(title) {
-  return clean(title)
-    .toLocaleLowerCase("ar")
-    .replace(/[ـ\u064B-\u065F\u0670]/g, "")
-    .replace(/[\s\p{P}\p{S}]+/gu, " ")
-    .trim();
-}
-
-function parseFeed(body) {
-  const found = [];
-  const blocks =
-    body.match(/<(?:item|entry)\b[\s\S]*?<\/(?:item|entry)>/gi) || [];
-
-  for (const block of blocks) {
-    const tm = block.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
-    const lm =
-      block.match(/<link\b[^>]*href=["']([^"']+)["'][^>]*\/?\s*>/i) ||
-      block.match(/<link\b[^>]*>([\s\S]*?)<\/link>/i) ||
-      block.match(/<guid\b[^>]*>([\s\S]*?)<\/guid>/i);
-
-    const title = clean(tm?.[1]);
-    const url = safeUrl(lm?.[1]);
-
-    if (title && url && /^\/Mnews\/\d+\/?$/i.test(new URL(url).pathname)) {
-      found.push({ title, url });
-    }
+  const regex = /<a[^>]+href=["']([^"']*\/Mnews\/\d+[^"']*)["'][^>]*>([^<]{8,200})<\/a>/gi;
+  let match;
+  while((match = regex.exec(relevantHtml))){
+    let url = match[1].trim();
+    let title = clean(decodeEntities(match[2])).trim();
+    
+    // استبعاد نفس المقال الأصلي 138173
+    if(url.includes("138173")) continue;
+    if(!url.startsWith("http")) url = "https://www.4may.net" + url;
+    if(title.length < 10 || title.length > 200) continue;
+    if(/^(الرئيسية|اتصل بنا|المزيد|اقرأ المزيد|صحيفة 4 مايو|اخبار وتقارير)$/i.test(title)) continue;
+    if(seen.has(url)) continue;
+    
+    seen.add(url);
+    items.push({ title, url });
+    if(items.length >= MAX_NEWS) break;
   }
-
-  const seenUrls = new Set();
-  const seenTitles = new Set();
-  const items = [];
-
-  for (const item of found) {
-    const key = titleKey(item.title);
-    if (item.title.length < 12 || !key) continue;
-    if (seenUrls.has(item.url) || seenTitles.has(key)) continue;
-
-    seenUrls.add(item.url);
-    seenTitles.add(key);
-    items.push(item);
-
-    if (items.length >= MAX_NEWS) break;
-  }
-
   return items;
 }
 
 module.exports = async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=60");
-
-  if (req.method !== "GET") {
-    res.setHeader("Allow", "GET");
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=120");
 
   try {
-    const response = await fetch(FEED_URL, {
+    const r = await fetch(TARGET_URL, {
       headers: {
-        "user-agent": "4MayNewsMirror/1.1",
-        accept: "application/rss+xml, application/xml, text/xml, */*"
-      },
-      signal: AbortSignal.timeout(15000)
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "ar-YE,ar;q=0.9",
+        "referer": "https://www.4may.net/"
+      }
     });
+    if(!r.ok) throw new Error("HTTP "+r.status);
 
-    if (!response.ok) {
-      throw new Error("Publisher returned HTTP " + response.status);
-    }
+    const html = await r.text();
+    const items = extractBottomNews(html);
 
-    const items = parseFeed(await response.text());
-
-    if (!items.length) {
-      throw new Error("No valid article links found in publisher feed");
-    }
+    if(!items.length) throw new Error("لم يتم العثور على أخبار أسفل المنشور - قد يكون التصميم تغير");
 
     return res.status(200).json({
-      source: FEED_URL,
+      source: TARGET_URL,
       updatedAt: new Date().toISOString(),
       count: items.length,
       items,
       error: null
     });
-  } catch (error) {
+
+  } catch (e) {
     return res.status(502).json({
-      source: FEED_URL,
+      source: TARGET_URL,
       updatedAt: null,
       count: 0,
       items: [],
-      error: error.message || "Fetch failed"
+      error: e.message
     });
   }
 };
